@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"golang.org/x/tools/go/types/typeutil"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -552,7 +551,6 @@ func (c *Checker) isRoot(pass *analysis.Pass, obj types.Object) bool {
 	}
 
 	if strings.Index(obj.Name(), "GLOBAL") >= 0 {
-		log.Printf("XXXXX %v", obj.Name())
 		return true
 	}
 	if isFunction(obj) {
