@@ -1,7 +1,8 @@
-#!/usr/bin/env python3.7
+#!/usr/bin/env python3.6
 
 import subprocess
 
+import logging
 import re
 import os
 import glob
@@ -17,7 +18,6 @@ class TargetDirs:
         if path in self.__dirs:
             return
         self.__dirs.add(path)
-        print("DIR",  path)
         self.__libs += glob.glob(f'{REPO_ROOT}/bazel-bin/' + path + '/*.a')
         self.__include_dirs.append(path)
 
@@ -59,6 +59,8 @@ def list_go_packages() -> List[str]:
             continue
         if root.find('automation/') >= 0:
             continue
+        #if root.find('grail-query') < 0 and not root.endswith('grail.com/testutil'):
+        #    continue
         packages.append(root)
 
     return packages
@@ -69,7 +71,7 @@ def find_cgo_libs() -> TargetDirs:
     for line in subprocess.check_output(
             ['bazel', 'query', 'deps(//go/src/grail.com/cgo/...)'],
             cwd=REPO_ROOT,
-            text=True).split('\n'):
+            universal_newlines=True).split('\n'):
         line = line.strip()
         if not line:
             continue
@@ -87,6 +89,7 @@ def find_cgo_libs() -> TargetDirs:
     return dirs
 
 def main() -> None:
+    logging.basicConfig(level=logging.DEBUG)
     dirs = find_cgo_libs()
     ldflags: List[str] = []
     cflags: List[str] = []
@@ -111,15 +114,29 @@ def main() -> None:
     standard_packages = [
         'sort',
         'io',
+        'encoding',
         'encoding/gob',
         'encoding/json',
         'container/heap',
     ]
-    subprocess.check_call(
+    cmdline = [UNUSED_PATH] + standard_packages + packages
+    print("CMDLINE", cmdline)
+    print("CFLAGS", envs['CGO_CFLAGS'])
+    print("LDFLAGS", envs['CGO_LDFLAGS'])
+    p = subprocess.Popen(
         [UNUSED_PATH] + standard_packages + packages,
         cwd=REPO_ROOT,
-        env=envs)
-
+        env=envs,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True)
+    for line in p.stdout.readlines():
+        if line.find(GOROOT) >= 0:
+            continue
+        #if line.startswith(REPO_ROOT + '/'):
+        #    line = line[len(REPO_ROOT + '/'):]
+        print(line, end='')
+    p.wait()
     #|grep -v //go |grep -v 'bazel_tools' |less
 
 main()

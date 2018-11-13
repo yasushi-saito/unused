@@ -1,31 +1,41 @@
 package main
 
 import (
+	// "log"
 	"go/ast"
 	"go/token"
 	"go/types"
+
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	// "golang.org/x/tools/go/ast/inspector"
 	"fmt"
-	"golang.org/x/tools/go/types/typeutil"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"golang.org/x/tools/go/types/typeutil"
 )
 
 var Pass1Analyzer = &analysis.Analyzer{
-	Name:     "pass1",
-	Doc:      "todo",
-	Run:      func(pass *analysis.Pass) (interface{}, error) { return checker.visit(pass) },
+	Name: "pass1",
+	Doc:  "todo",
+	Run: func(pass *analysis.Pass) (interface{}, error) {
+		checker.mu.Lock()
+		checker.pkgs = append(checker.pkgs, pass)
+		checker.mu.Unlock()
+		return nil, nil
+	},
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 }
 
+type hashKey string
+
 type graph struct {
 	roots []*graphNode
-	nodes map[interface{}]*graphNode
+	nodes map[hashKey]*graphNode
 	seq   int
 }
 
@@ -34,8 +44,9 @@ type Checker struct {
 	ConsiderReflection bool
 	Debug              io.Writer
 
-	mu           sync.Mutex
-	pkgs         []*analysis.Pass
+	mu   sync.Mutex
+	pkgs []*analysis.Pass
+
 	graph        *graph
 	msCache      typeutil.MethodSetCache
 	topmostCache map[*types.Scope]*types.Scope
@@ -45,15 +56,60 @@ type Checker struct {
 var checker = &Checker{
 	WholeProgram: true,
 	graph: &graph{
-		nodes: map[interface{}]*graphNode{},
+		nodes: map[hashKey]*graphNode{},
 		seq:   1,
 	},
 	topmostCache: map[*types.Scope]*types.Scope{},
 }
 
-func (g *graph) markUsedBy(obj, usedBy interface{}) {
-	objNode := g.getNode(obj)
-	usedByNode := g.getNode(usedBy)
+func hashObject(pass *analysis.Pass, obj interface{}) hashKey {
+	switch v := obj.(type) {
+	// case *types.Pointer:
+	// case *types.Named:
+	// case *types.Slice:
+	//case *types.Basic:
+	// case *types.Func:
+		// log.Printf("TYPE: %+v", obj)
+	case *types.Named:
+		pos := pass.Fset.Position(v.Obj().Pos())
+		return hashKey(fmt.Sprintf("sig:%s:%s:%d", v.String(), pos.Filename, pos.Offset))
+	case *types.Scope:
+		pos := pass.Fset.Position(v.Pos())
+		return hashKey(fmt.Sprintf("sig:%s:%s:%d", v.String(), pos.Filename, pos.Offset))
+	case *ast.Ident:
+		pos := pass.Fset.Position(v.NamePos)
+		return hashKey(fmt.Sprintf("id:%s:%s:%d", v.Name, pos.Filename, pos.Offset))
+	case *ast.SelectorExpr:
+		pos := pass.Fset.Position(v.Sel.NamePos)
+		return hashKey(fmt.Sprintf("sel:%s:%d", pos.Filename, pos.Offset))
+	case *ast.CompositeLit:
+		pos := pass.Fset.Position(v.Lbrace)
+		return hashKey(fmt.Sprintf("cl:%s:%d", pos.Filename, pos.Offset))
+	case *ast.CallExpr:
+		pos := pass.Fset.Position(v.Lparen)
+		return hashKey(fmt.Sprintf("call:%s:%s:%d", pos.Filename, pos.Offset))
+	case *ast.IndexExpr:
+		pos := pass.Fset.Position(v.Lbrack)
+		return hashKey(fmt.Sprintf("idx:%s:%s:%d", pos.Filename, pos.Offset))
+	case *ast.ParenExpr:
+		pos := pass.Fset.Position(v.Lparen)
+		return hashKey(fmt.Sprintf("paren:%s:%s:%d", pos.Filename, pos.Offset))
+	case *ast.TypeAssertExpr:
+		pos := pass.Fset.Position(v.Lparen)
+		return hashKey(fmt.Sprintf("paren:%s:%s:%d", pos.Filename, pos.Offset))
+	case types.Object:
+		pos := pass.Fset.Position(v.Pos())
+		return hashKey(fmt.Sprintf("obj:%s:%s:%d", v.String(), pos.Filename, pos.Offset))
+	case types.Type:
+		//return hashKey("type:" + v.String() + "@" + v.Underlying().String())
+		return hashKey(fmt.Sprintf("type:%p", obj))
+	}
+	panic(fmt.Sprintf("Invalid object: %+v", obj))
+}
+
+func (g *graph) markUsedBy(pass *analysis.Pass, obj, usedBy interface{}) {
+	objNode := g.getNode(pass, obj)
+	usedByNode := g.getNode(pass, usedBy)
 	if objNode.obj == usedByNode.obj {
 		return
 	}
@@ -62,18 +118,12 @@ func (g *graph) markUsedBy(obj, usedBy interface{}) {
 }
 
 type graphNode struct {
+	pass  *analysis.Pass
 	obj   interface{}
 	uses  map[*graphNode]struct{}
 	used  bool
 	quiet bool
 	n     int
-}
-
-func (c *Checker) visit(pass *analysis.Pass) (interface{}, error) {
-	c.mu.Lock()
-	c.pkgs = append(c.pkgs, pass)
-	c.mu.Unlock()
-	return nil, nil
 }
 
 func (c *Checker) findExportedInterfaces() {
@@ -101,7 +151,7 @@ func (c *Checker) checkPackage(pass *analysis.Pass) {
 	c.processAST(pass)
 }
 
-func (g *graph) getNode(obj interface{}) *graphNode {
+func (g *graph) getNode(pass *analysis.Pass, obj interface{}) *graphNode {
 	for {
 		if pt, ok := obj.(*types.Pointer); ok {
 			obj = pt.Elem()
@@ -109,28 +159,28 @@ func (g *graph) getNode(obj interface{}) *graphNode {
 			break
 		}
 	}
-	_, ok := g.nodes[obj]
+	key := hashObject(pass, obj)
+	node, ok := g.nodes[key]
 	if !ok {
-		g.addObj(obj)
-	}
-	return g.nodes[obj]
-}
-
-func (g *graph) addObj(obj interface{}) {
-	if pt, ok := obj.(*types.Pointer); ok {
-		obj = pt.Elem()
-	}
-	node := &graphNode{obj: obj, uses: make(map[*graphNode]struct{}), n: g.seq}
-	g.nodes[obj] = node
-	g.seq++
-
-	if obj, ok := obj.(*types.Struct); ok {
-		n := obj.NumFields()
-		for i := 0; i < n; i++ {
-			field := obj.Field(i)
-			g.markUsedBy(obj, field)
+		if _, ok := obj.(*types.Pointer); ok {
+			panic(obj)
+		}
+		// if pt, ok := obj.(*types.Pointer); ok {
+		// 	obj = pt.Elem()
+		// }
+		// log.Printf("Addnode: %v: %v", key, obj)
+		node = &graphNode{pass: pass, obj: obj, uses: make(map[*graphNode]struct{}), n: g.seq}
+		g.nodes[key] = node
+		g.seq++
+		if obj, ok := obj.(*types.Struct); ok {
+			n := obj.NumFields()
+			for i := 0; i < n; i++ {
+				field := obj.Field(i)
+				g.markUsedBy(pass, obj, field)
+			}
 		}
 	}
+	return node
 }
 
 func (c *Checker) processDefs(pass *analysis.Pass) {
@@ -138,12 +188,12 @@ func (c *Checker) processDefs(pass *analysis.Pass) {
 		if obj == nil {
 			continue
 		}
-		c.graph.getNode(obj)
+		c.graph.getNode(pass, obj)
 
 		if obj, ok := obj.(*types.TypeName); ok {
-			c.graph.markUsedBy(obj.Type().Underlying(), obj.Type())
-			c.graph.markUsedBy(obj.Type(), obj) // TODO is this needed?
-			c.graph.markUsedBy(obj, obj.Type())
+			c.graph.markUsedBy(pass, obj.Type().Underlying(), obj.Type())
+			c.graph.markUsedBy(pass, obj.Type(), obj) // TODO is this needed?
+			c.graph.markUsedBy(pass, obj, obj.Type())
 
 			// We mark all exported fields as used. For normal
 			// operation, we have to. The user may use these fields
@@ -155,7 +205,7 @@ func (c *Checker) processDefs(pass *analysis.Pass) {
 			// mark them used if an instance of the type was
 			// accessible via an interface value.
 			if !c.WholeProgram || c.ConsiderReflection {
-				c.useExportedFields(obj.Type())
+				c.useExportedFields(pass, obj.Type())
 			}
 
 			// TODO(dh): Traditionally we have not marked all exported
@@ -165,7 +215,7 @@ func (c *Checker) processDefs(pass *analysis.Pass) {
 			// not worth the false negatives. With the new -reflect
 			// flag, however, we should reconsider that choice.
 			if !c.WholeProgram {
-				c.useExportedMethods(obj.Type())
+				c.useExportedMethods(pass, obj.Type())
 			}
 		}
 
@@ -178,16 +228,16 @@ func (c *Checker) processDefs(pass *analysis.Pass) {
 				//
 				// Also operates on funcs and type names, but that's
 				// irrelevant/redundant.
-				c.graph.markUsedBy(obj.Type(), obj)
+				c.graph.markUsedBy(pass, obj.Type(), obj)
 			}
 			if obj.Name() == "_" {
-				node := c.graph.getNode(obj)
+				node := c.graph.getNode(pass, obj)
 				node.quiet = true
 				scope := c.topmostScope(pass.Pkg.Scope().Innermost(obj.Pos()), pass.Pkg)
 				if scope == pass.Pkg.Scope() {
 					c.graph.roots = append(c.graph.roots, node)
 				} else {
-					c.graph.markUsedBy(obj, scope)
+					c.graph.markUsedBy(pass, obj, scope)
 				}
 			} else {
 				// Variables declared in functions are used. This is
@@ -195,8 +245,8 @@ func (c *Checker) processDefs(pass *analysis.Pass) {
 				// always marked as used.
 				if _, ok := obj.(*types.Var); ok {
 					if obj.Parent() != obj.Pkg().Scope() && obj.Parent() != nil {
-						c.graph.markUsedBy(obj, c.topmostScope(obj.Parent(), obj.Pkg()))
-						c.graph.markUsedBy(obj.Type(), obj)
+						c.graph.markUsedBy(pass, obj, c.topmostScope(obj.Parent(), obj.Pkg()))
+						c.graph.markUsedBy(pass, obj.Type(), obj)
 					}
 				}
 			}
@@ -204,14 +254,14 @@ func (c *Checker) processDefs(pass *analysis.Pass) {
 
 		if fn, ok := obj.(*types.Func); ok {
 			// A function uses its signature
-			c.graph.markUsedBy(fn, fn.Type())
+			c.graph.markUsedBy(pass, fn, fn.Type())
 
 			// A function uses its return types
 			sig := fn.Type().(*types.Signature)
 			res := sig.Results()
 			n := res.Len()
 			for i := 0; i < n; i++ {
-				c.graph.markUsedBy(res.At(i).Type(), fn)
+				c.graph.markUsedBy(pass, res.At(i).Type(), fn)
 			}
 		}
 
@@ -220,15 +270,15 @@ func (c *Checker) processDefs(pass *analysis.Pass) {
 			Pkg() *types.Package
 		}); ok {
 			scope := obj.Scope()
-			c.graph.markUsedBy(c.topmostScope(scope, obj.Pkg()), obj)
+			c.graph.markUsedBy(pass, c.topmostScope(scope, obj.Pkg()), obj)
 		}
 
 		if c.isRoot(pass, obj) {
-			node := c.graph.getNode(obj)
+			node := c.graph.getNode(pass, obj)
 			c.graph.roots = append(c.graph.roots, node)
 			if obj, ok := obj.(*types.PkgName); ok {
 				scope := obj.Pkg().Scope()
-				c.graph.markUsedBy(scope, obj)
+				c.graph.markUsedBy(pass, scope, obj)
 			}
 		}
 	}
@@ -329,12 +379,12 @@ func (c *Checker) processUses(pass *analysis.Pass) (interface{}, error) {
 		scope := pass.Pkg.Scope().Innermost(pos)
 		scope = c.topmostScope(scope, pass.Pkg)
 		if scope != pass.Pkg.Scope() {
-			c.graph.markUsedBy(usedObj, scope)
+			c.graph.markUsedBy(pass, usedObj, scope)
 		}
 
 		switch usedObj.(type) {
 		case *types.Var, *types.Const:
-			c.graph.markUsedBy(usedObj.Type(), usedObj)
+			c.graph.markUsedBy(pass, usedObj.Type(), usedObj)
 		}
 	}
 	return nil, nil
@@ -347,22 +397,22 @@ func (c *Checker) processTypes(pass *analysis.Pass) (interface{}, error) {
 		if typ, ok := tv.Type.(interface {
 			Elem() types.Type
 		}); ok {
-			c.graph.markUsedBy(typ.Elem(), typ)
+			c.graph.markUsedBy(pass, typ.Elem(), typ)
 		}
 
 		switch obj := tv.Type.(type) {
 		case *types.Named:
 			named[obj] = types.NewPointer(obj)
-			c.graph.markUsedBy(obj, obj.Underlying())
-			c.graph.markUsedBy(obj.Underlying(), obj)
+			c.graph.markUsedBy(pass, obj, obj.Underlying())
+			c.graph.markUsedBy(pass, obj.Underlying(), obj)
 		case *types.Interface:
 			if obj.NumMethods() > 0 {
 				interfaces = append(interfaces, obj)
 			}
 		case *types.Struct:
-			c.useNoCopyFields(obj)
+			c.useNoCopyFields(pass, obj)
 			if pass.Pkg.Name() != "main" && !c.WholeProgram {
-				c.useExportedFields(obj)
+				c.useExportedFields(pass, obj)
 			}
 		}
 	}
@@ -397,12 +447,12 @@ func (c *Checker) processTypes(pass *analysis.Pass) (interface{}, error) {
 					if !found {
 						continue
 					}
-					c.graph.markUsedBy(meth.Type().(*types.Signature).Recv().Type(), obj) // embedded receiver
+					c.graph.markUsedBy(pass, meth.Type().(*types.Signature).Recv().Type(), obj) // embedded receiver
 					if len(sel.Index()) > 1 {
 						f := getField(obj, sel.Index()[0])
-						c.graph.markUsedBy(f, obj) // embedded receiver
+						c.graph.markUsedBy(pass, f, obj) // embedded receiver
 					}
-					c.graph.markUsedBy(meth, obj)
+					c.graph.markUsedBy(pass, meth, obj)
 				}
 			}
 		}
@@ -612,32 +662,32 @@ func isNoCopyType(typ types.Type) bool {
 	return true
 }
 
-func (c *Checker) useNoCopyFields(typ types.Type) {
+func (c *Checker) useNoCopyFields(pass *analysis.Pass, typ types.Type) {
 	if st, ok := typ.Underlying().(*types.Struct); ok {
 		n := st.NumFields()
 		for i := 0; i < n; i++ {
 			field := st.Field(i)
 			if isNoCopyType(field.Type()) {
-				c.graph.markUsedBy(field, typ)
-				c.graph.markUsedBy(field.Type().(*types.Named).Method(0), field.Type())
+				c.graph.markUsedBy(pass, field, typ)
+				c.graph.markUsedBy(pass, field.Type().(*types.Named).Method(0), field.Type())
 			}
 		}
 	}
 }
 
-func (c *Checker) useExportedFields(typ types.Type) {
+func (c *Checker) useExportedFields(pass *analysis.Pass, typ types.Type) {
 	if st, ok := typ.Underlying().(*types.Struct); ok {
 		n := st.NumFields()
 		for i := 0; i < n; i++ {
 			field := st.Field(i)
 			if field.Exported() {
-				c.graph.markUsedBy(field, typ)
+				c.graph.markUsedBy(pass, field, typ)
 			}
 		}
 	}
 }
 
-func (c *Checker) useExportedMethods(typ types.Type) {
+func (c *Checker) useExportedMethods(pass *analysis.Pass, typ types.Type) {
 	named, ok := typ.(*types.Named)
 	if !ok {
 		return
@@ -646,7 +696,7 @@ func (c *Checker) useExportedMethods(typ types.Type) {
 	for i := 0; i < len(ms); i++ {
 		meth := ms[i].Obj()
 		if meth.Exported() {
-			c.graph.markUsedBy(meth, typ)
+			c.graph.markUsedBy(pass, meth, typ)
 		}
 	}
 
@@ -663,7 +713,7 @@ func (c *Checker) useExportedMethods(typ types.Type) {
 		ms := typeutil.IntuitiveMethodSet(field.Type(), &c.msCache)
 		for j := 0; j < len(ms); j++ {
 			if ms[j].Obj().Exported() {
-				c.graph.markUsedBy(field, typ)
+				c.graph.markUsedBy(pass, field, typ)
 				break
 			}
 		}
@@ -692,15 +742,15 @@ func getField(typ types.Type, idx int) *types.Var {
 func (c *Checker) processSelections(pass *analysis.Pass) {
 	fn := func(expr *ast.SelectorExpr, sel *types.Selection, offset int) {
 		scope := pass.Pkg.Scope().Innermost(expr.Pos())
-		c.graph.markUsedBy(expr.X, c.topmostScope(scope, pass.Pkg))
-		c.graph.markUsedBy(sel.Obj(), expr.X)
+		c.graph.markUsedBy(pass, expr.X, c.topmostScope(scope, pass.Pkg))
+		c.graph.markUsedBy(pass, sel.Obj(), expr.X)
 		if len(sel.Index()) > 1 {
 			typ := sel.Recv()
 			indices := sel.Index()
 			for _, idx := range indices[:len(indices)-offset] {
 				obj := getField(typ, idx)
 				typ = obj.Type()
-				c.graph.markUsedBy(obj, expr.X)
+				c.graph.markUsedBy(pass, obj, expr.X)
 			}
 		}
 	}
@@ -746,7 +796,7 @@ func (c *Checker) processConversion(pass *analysis.Pass, node ast.Node) {
 			// layout)
 			n := typDst.NumFields()
 			for i := 0; i < n; i++ {
-				c.graph.markUsedBy(typDst.Field(i), typDst)
+				c.graph.markUsedBy(pass, typDst.Field(i), typDst)
 			}
 			return
 		}
@@ -773,13 +823,13 @@ func (c *Checker) processConversion(pass *analysis.Pass, node ast.Node) {
 		for i := 0; i < n; i++ {
 			fDst := typDst.Field(i)
 			fSrc := typSrc.Field(i)
-			c.graph.markUsedBy(fDst, fSrc)
-			c.graph.markUsedBy(fSrc, fDst)
+			c.graph.markUsedBy(pass, fDst, fSrc)
+			c.graph.markUsedBy(pass, fSrc, fDst)
 		}
 	}
 }
 
-func (c *Checker) markFields(typ types.Type) {
+func (c *Checker) markFields(pass *analysis.Pass, typ types.Type) {
 	structType, ok := typ.Underlying().(*types.Struct)
 	if !ok {
 		return
@@ -787,7 +837,7 @@ func (c *Checker) markFields(typ types.Type) {
 	n := structType.NumFields()
 	for i := 0; i < n; i++ {
 		field := structType.Field(i)
-		c.graph.markUsedBy(field, typ)
+		c.graph.markUsedBy(pass, field, typ)
 	}
 }
 
@@ -805,7 +855,7 @@ func (c *Checker) processCompositeLiteral(pass *analysis.Pass, node ast.Node) {
 		}
 
 		if isBasicStruct(node.Elts) {
-			c.markFields(typ)
+			c.markFields(pass, typ)
 		}
 	}
 }
@@ -822,7 +872,7 @@ func (c *Checker) processCgoExported(pass *analysis.Pass, node ast.Node) {
 				return
 			}
 			obj := pass.TypesInfo.ObjectOf(node.Name)
-			c.graph.roots = append(c.graph.roots, c.graph.getNode(obj))
+			c.graph.roots = append(c.graph.roots, c.graph.getNode(pass, obj))
 		}
 	}
 }
@@ -845,7 +895,7 @@ func (c *Checker) processVariableDeclaration(pass *analysis.Pass, node ast.Node)
 						if _, ok := obj.(*types.PkgName); ok {
 							return true
 						}
-						c.graph.markUsedBy(obj, pass.TypesInfo.ObjectOf(name))
+						c.graph.markUsedBy(pass, obj, pass.TypesInfo.ObjectOf(name))
 					}
 					return true
 				}
@@ -861,7 +911,7 @@ func (c *Checker) processArrayConstants(pass *analysis.Pass, node ast.Node) {
 		if !ok {
 			return
 		}
-		c.graph.markUsedBy(pass.TypesInfo.ObjectOf(ident), pass.TypesInfo.TypeOf(decl))
+		c.graph.markUsedBy(pass, pass.TypesInfo.ObjectOf(ident), pass.TypesInfo.TypeOf(decl))
 	}
 }
 
@@ -904,7 +954,7 @@ func (c *Checker) processKnownReflectMethodCallers(pass *analysis.Pass, node ast
 	typ := pass.TypesInfo.TypeOf(arg)
 	ms := types.NewMethodSet(typ)
 	for i := 0; i < ms.Len(); i++ {
-		c.graph.markUsedBy(ms.At(i).Obj(), typ)
+		c.graph.markUsedBy(pass, ms.At(i).Obj(), typ)
 	}
 }
 
@@ -946,28 +996,28 @@ func (c *Checker) markNodesQuiet() {
 			node.quiet = true
 			continue
 		}
-		c.markObjQuiet(node.obj)
+		c.markObjQuiet(node.pass, node.obj)
 	}
 }
 
-func (c *Checker) markObjQuiet(obj interface{}) {
+func (c *Checker) markObjQuiet(pass *analysis.Pass, obj interface{}) {
 	switch obj := obj.(type) {
 	case *types.Named:
 		n := obj.NumMethods()
 		for i := 0; i < n; i++ {
 			meth := obj.Method(i)
-			node := c.graph.getNode(meth)
+			node := c.graph.getNode(pass, obj)
 			node.quiet = true
-			c.markObjQuiet(meth.Scope())
+			c.markObjQuiet(pass, meth.Scope())
 		}
 	case *types.Struct:
 		n := obj.NumFields()
 		for i := 0; i < n; i++ {
 			field := obj.Field(i)
-			c.graph.nodes[field].quiet = true
+			c.graph.nodes[hashObject(pass, field)].quiet = true
 		}
 	case *types.Func:
-		c.markObjQuiet(obj.Scope())
+		c.markObjQuiet(pass, obj.Scope())
 	case *types.Scope:
 		if obj == nil {
 			return
@@ -977,13 +1027,13 @@ func (c *Checker) markObjQuiet(obj interface{}) {
 		}
 		for _, name := range obj.Names() {
 			v := obj.Lookup(name)
-			if n, ok := c.graph.nodes[v]; ok {
+			if n, ok := c.graph.nodes[hashObject(pass, v)]; ok {
 				n.quiet = true
 			}
 		}
 		n := obj.NumChildren()
 		for i := 0; i < n; i++ {
-			c.markObjQuiet(obj.Child(i))
+			c.markObjQuiet(pass, obj.Child(i))
 		}
 	}
 }
@@ -1000,7 +1050,7 @@ func (c *Checker) findUnused() []Unused {
 		if !ok {
 			continue
 		}
-		typNode, ok := c.graph.nodes[obj.Type()]
+		typNode, ok := c.graph.nodes[hashObject(node.pass, obj.Type())]
 		if !ok {
 			continue
 		}
