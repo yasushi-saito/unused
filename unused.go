@@ -97,6 +97,9 @@ func hashObject(pass *analysis.Pass, obj interface{}) hashKey {
 	case *ast.TypeAssertExpr:
 		pos := pass.Fset.Position(v.Lparen)
 		return hashKey(fmt.Sprintf("paren:%s:%s:%d", pos.Filename, pos.Offset))
+	case *ast.SliceExpr:
+		pos := pass.Fset.Position(v.Lbrack)
+		return hashKey(fmt.Sprintf("paren:%s:%s:%d", pos.Filename, pos.Offset))
 	case types.Object:
 		pos := pass.Fset.Position(v.Pos())
 		return hashKey(fmt.Sprintf("obj:%s:%s:%d", v.String(), pos.Filename, pos.Offset))
@@ -108,6 +111,9 @@ func hashObject(pass *analysis.Pass, obj interface{}) hashKey {
 }
 
 func (g *graph) markUsedBy(pass *analysis.Pass, obj, usedBy interface{}) {
+	if obj == nil || usedBy == nil {
+		return
+	}
 	objNode := g.getNode(pass, obj)
 	usedByNode := g.getNode(pass, usedBy)
 	if objNode.obj == usedByNode.obj {

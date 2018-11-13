@@ -89,7 +89,7 @@ def find_cgo_libs() -> TargetDirs:
     return dirs
 
 def main() -> None:
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     dirs = find_cgo_libs()
     ldflags: List[str] = []
     cflags: List[str] = []
@@ -120,9 +120,9 @@ def main() -> None:
         'container/heap',
     ]
     cmdline = [UNUSED_PATH] + standard_packages + packages
-    print("CMDLINE", cmdline)
-    print("CFLAGS", envs['CGO_CFLAGS'])
-    print("LDFLAGS", envs['CGO_LDFLAGS'])
+    log.debug("CMDLINE %s", cmdline)
+    log.debug("CFLAGS %s", envs['CGO_CFLAGS'])
+    log.debug("LDFLAGS %s", envs['CGO_LDFLAGS'])
     p = subprocess.Popen(
         [UNUSED_PATH] + standard_packages + packages,
         cwd=REPO_ROOT,
